@@ -1,0 +1,362 @@
+version: "3.8"
+
+# ============================================
+# SupportIntel - Complete Infrastructure
+# AI-Powered Customer Support Intelligence Platform
+# ============================================
+
+x-common-variables: &common-variables
+  ENVIRONMENT: development
+  DEBUG: "true"
+  LOG_LEVEL: DEBUG
+  BACKEND_HOST: 0.0.0.0
+  BACKEND_PORT: 8000
+  BACKEND_CORS_ORIGINS: '["http://localhost:3000","http://localhost:5173","http://frontend:80"]'
+
+services:
+  # ============================================
+  # MySQL - Primary Database
+  # ============================================
+  mysql:
+    image: mysql:8.0
+    container_name: supportintel-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root_password_secure_2024}
+      MYSQL_DATABASE: supportintel_db
+      MYSQL_USER: supportintel_user
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-supportintel_pass}
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./docker/mysql/init:/docker-entrypoint-initdb.d
+      - ./docker/mysql/conf:/etc/mysql/conf.d
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 20s
+      retries: 10
+      start_period: 30s
+    networks:
+      - supportintel-network
+
+  # ============================================
+  # Redis - Cache, Sessions, Message Broker
+  # ============================================
+  redis:
+    image: redis:7-alpine
+    container_name: supportintel-redis
+    restart: unless-stopped
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+    command: >
+      redis-server --appendonly yes
+      --requirepass ${REDIS_PASSWORD:-redis_pass_secure_2024}
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - supportintel-network
+
+  # ============================================
+  # Kafka - Event Streaming
+  # ============================================
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.7.1
+    container_name: supportintel-zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_SYNC_LIMIT: 2
+    healthcheck:
+      test: ["CMD", "echo", "ruok", "|", "nc", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - supportintel-network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.7.1
+    container_name: supportintel-kafka
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_RETENTION_BYTES: 1073741824
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - supportintel-network
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: supportintel-kafka-ui
+    restart: unless-stopped
+    depends_on:
+      - kafka
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: supportintel
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    networks:
+      - supportintel-network
+
+  # ============================================
+  # MinIO - S3-Compatible Object Storage
+  # ============================================
+  minio:
+    image: minio/minio:latest
+    container_name: supportintel-minio
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - supportintel-network
+
+  # ============================================
+  # Celery Worker - Background Task Processing
+  # ============================================
+  celery-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: supportintel-celery
+    restart: unless-stopped
+    command: >
+      sh -c "celery -A app.core.celery_app worker
+      --loglevel=info
+      --concurrency=4
+      --max-tasks-per-child=100
+      --queues=default,embeddings,classifications,emails"
+    env_file:
+      - .env
+    environment:
+      <<: *common-variables
+      DATABASE_URL: mysql+aiomysql://supportintel_user:${MYSQL_PASSWORD:-supportintel_pass}@mysql:3306/supportintel_db
+      DATABASE_SYNC_URL: mysql+pymysql://supportintel_user:${MYSQL_PASSWORD:-supportintel_pass}@mysql:3306/supportintel_db
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_pass_secure_2024}@redis:6379/0
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    volumes:
+      - ./backend:/app
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+      minio:
+        condition: service_healthy
+    networks:
+      - supportintel-network
+
+  celery-beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: supportintel-celery-beat
+    restart: unless-stopped
+    command: >
+      sh -c "celery -A app.core.celery_app beat
+      --loglevel=info
+      --schedule=/tmp/celerybeat-schedule"
+    env_file:
+      - .env
+    environment:
+      <<: *common-variables
+      DATABASE_URL: mysql+aiomysql://supportintel_user:${MYSQL_PASSWORD:-supportintel_pass}@mysql:3306/supportintel_db
+      DATABASE_SYNC_URL: mysql+pymysql://supportintel_user:${MYSQL_PASSWORD:-supportintel_pass}@mysql:3306/supportintel_db
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_pass_secure_2024}@redis:6379/0
+    volumes:
+      - ./backend:/app
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - supportintel-network
+
+  # ============================================
+  # Flower - Celery Monitoring
+  # ============================================
+  flower:
+    image: mher/flower:2.0
+    container_name: supportintel-flower
+    restart: unless-stopped
+    ports:
+      - "5555:5555"
+    environment:
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-redis_pass_secure_2024}@redis:6379/0
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-redis_pass_secure_2024}@redis:6379/0
+      FLOWER_PORT: 5555
+    depends_on:
+      - redis
+      - celery-worker
+    networks:
+      - supportintel-network
+
+  # ============================================
+  # Backend - FastAPI Application
+  # ============================================
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: supportintel-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      <<: *common-variables
+      DATABASE_URL: mysql+aiomysql://supportintel_user:${MYSQL_PASSWORD:-supportintel_pass}@mysql:3306/supportintel_db
+      DATABASE_SYNC_URL: mysql+pymysql://supportintel_user:${MYSQL_PASSWORD:-supportintel_pass}@mysql:3306/supportintel_db
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_pass_secure_2024}@redis:6379/0
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - backend_media:/app/media
+    command: >
+      sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+    networks:
+      - supportintel-network
+
+  # ============================================
+  # Frontend - React Application
+  # ============================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - VITE_API_URL=http://localhost:8000/api/v1
+    container_name: supportintel-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    environment:
+      - VITE_API_URL=http://localhost:8000/api/v1
+      - VITE_WS_URL=ws://localhost:8000/ws
+    networks:
+      - supportintel-network
+
+  # ============================================
+  # Prometheus - Metrics Collection (Monitoring)
+  # ============================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: supportintel-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/monitoring/prometheus:/etc/prometheus
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    networks:
+      - supportintel-network
+
+  # ============================================
+  # Grafana - Visualization (Monitoring)
+  # ============================================
+  grafana:
+    image: grafana/grafana:latest
+    container_name: supportintel-grafana
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./docker/monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./docker/monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+      - grafana_data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-grafana_admin_2024}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    depends_on:
+      - prometheus
+    networks:
+      - supportintel-network
+
+volumes:
+  mysql_data:
+  redis_data:
+  kafka_data:
+  minio_data:
+  backend_media:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  supportintel-network:
+    driver: bridge
+
